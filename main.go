@@ -36,6 +36,14 @@ type OllamaResponse struct {
 	// Other fields might be present depending on the response, like context, total_duration, etc.
 }
 
+// CommitAuditData holds the Git metadata and the generated summary for a commit.
+type CommitAuditData struct {
+	Hash    string
+	Author  string
+	Date    string
+	Summary string
+}
+
 func main() {
 	repoPath := flag.String("repo", ".", "Path to the Git repository")
 	commitID := flag.String("commit", "", "The oldest commit ID to audit to")
@@ -82,8 +90,8 @@ func main() {
 		fmt.Println(hash)
 	}
 
-	var allGeneratedMessages []string // Slice to store all AI-generated messages
-	var retryQueueCommits []string    // Slice to store commit hashes that need retrying
+	var allAuditedCommits []CommitAuditData // Slice to store all successfully audited commits
+	var retryQueueCommits []string          // Slice to store commit hashes that need retrying
 
 	// Initial processing loop
 	fmt.Println("--- Initial Processing Pass ---")
@@ -131,8 +139,23 @@ Patch:
 			retryQueueCommits = append(retryQueueCommits, commitHash)
 			continue
 		}
-		fmt.Printf("Successfully generated message for commit %s\n", commitHash)
-		allGeneratedMessages = append(allGeneratedMessages, generatedMessage)
+
+		commitGitHash, author, date, err := getCommitMetadata(*repoPath, commitHash)
+		if err != nil {
+			errMsg := fmt.Sprintf("Error getting metadata for commit %s: %v. Adding to retry queue.", commitHash, err)
+			fmt.Println(errMsg)
+			retryQueueCommits = append(retryQueueCommits, commitHash)
+			continue
+		}
+
+		fmt.Printf("Successfully processed commit %s (Got Ollama summary and Git metadata)\n", commitHash)
+		auditData := CommitAuditData{
+			Hash:    commitGitHash,
+			Author:  author,
+			Date:    date,
+			Summary: generatedMessage,
+		}
+		allAuditedCommits = append(allAuditedCommits, auditData)
 	}
 
 	// Retry loop
@@ -197,39 +220,45 @@ Patch:
 				currentFailures++
 				continue
 			}
-			fmt.Printf("Successfully generated message for commit %s on retry\n", commitHash)
-			allGeneratedMessages = append(allGeneratedMessages, generatedMessage)
+
+			commitGitHash, author, date, err := getCommitMetadata(*repoPath, commitHash)
+			if err != nil {
+				errMsg := fmt.Sprintf("Error getting metadata for commit %s during retry: %v. Will retry again.", commitHash, err)
+				fmt.Println(errMsg)
+				nextRetryQueue = append(nextRetryQueue, commitHash)
+				currentFailures++
+				continue
+			}
+			fmt.Printf("Successfully processed commit %s on retry (Got Ollama summary and Git metadata)\n", commitHash)
+			auditData := CommitAuditData{
+				Hash:    commitGitHash,
+				Author:  author,
+				Date:    date,
+				Summary: generatedMessage,
+			}
+			allAuditedCommits = append(allAuditedCommits, auditData) // Add to the main list
 		}
 		retryQueueCommits = nextRetryQueue
-
-		if len(retryQueueCommits) > 0 && currentFailures == len(retryQueueCommits) {
-			fmt.Printf("All %d commits in the current retry pass failed. Retrying them again in the next pass.\n", currentFailures)
-			// No sleep here as per "ad infinitum" but in a real-world scenario, a small delay might be added.
-		}
-		// If the inner loop was broken due to interruption, retryQueueCommits might be populated by the interruption logic.
-		// If not, it's populated by nextRetryQueue from a normal pass.
-		if !interrupted {
-			retryQueueCommits = nextRetryQueue
-		}
-
 
 		if len(retryQueueCommits) > 0 && currentFailures == len(retryQueueCommits) && !interrupted {
 			fmt.Printf("All %d commits in the current retry pass failed. Retrying them again in the next pass.\n", currentFailures)
 			// No sleep here as per "ad infinitum" but in a real-world scenario, a small delay might be added.
 		}
+		// The duplicated retryQueueCommits = nextRetryQueue and the subsequent if block were simplified
+		// as the state of interrupted is checked at the beginning of the outer loop and inner loop.
 	}
 
-	// Write all successful messages to gitaudit.txt
-	if len(allGeneratedMessages) > 0 {
+	// Write all successful audit data to gitaudit.txt
+	if len(allAuditedCommits) > 0 {
 		outputFileName := "gitaudit.txt"
-		err = writeMessagesToFile(outputFileName, allGeneratedMessages)
+		err = writeMessagesToFile(outputFileName, allAuditedCommits) // Pass allAuditedCommits
 		if err != nil {
-			fmt.Printf("Error writing messages to file %s: %v\n", outputFileName, err)
+			fmt.Printf("Error writing audited commit data to file %s: %v\n", outputFileName, err)
 		} else {
-			fmt.Printf("\nSuccessfully wrote %d generated messages to %s\n", len(allGeneratedMessages), outputFileName)
+			fmt.Printf("\nSuccessfully wrote %d audited commit entries to %s\n", len(allAuditedCommits), outputFileName)
 		}
 	} else {
-		fmt.Println("\nNo messages were successfully generated to write to file.")
+		fmt.Println("\nNo audited commit data was successfully generated to write to file.")
 	}
 
 	mu.Lock()
@@ -260,26 +289,28 @@ Patch:
 	}
 }
 
-// writeMessagesToFile writes a list of messages to the specified file,
-// with each message separated by a standard delimiter.
-func writeMessagesToFile(filename string, messages []string) error {
+// writeMessagesToFile writes a list of CommitAuditData to the specified file,
+// with each entry formatted and separated by a standard delimiter.
+func writeMessagesToFile(filename string, auditedCommits []CommitAuditData) error {
 	file, err := os.Create(filename)
 	if err != nil {
 		return fmt.Errorf("failed to create file %s: %w", filename, err)
 	}
 	defer file.Close()
 
-	for i, message := range messages {
-		_, err := file.WriteString(message)
+	for i, data := range auditedCommits {
+		entry := fmt.Sprintf("Commit: %s\nAuthor: %s\nDate: %s\n\n%s\n",
+			data.Hash, data.Author, data.Date, data.Summary)
+		_, err := file.WriteString(entry)
 		if err != nil {
-			return fmt.Errorf("failed to write message to file: %w", err)
+			return fmt.Errorf("failed to write audit data to file for commit %s: %w", data.Hash, err)
 		}
-		// Add a separator between messages, but not after the last one.
-		// Using a triple hyphen, similar to `git format-patch` or common document separators.
-		if i < len(messages)-1 {
-			_, err = file.WriteString("\n\n---\n\n")
+
+		// Add a separator between entries, but not after the last one.
+		if i < len(auditedCommits)-1 {
+			_, err = file.WriteString("\n---\n\n") // Adjusted separator for better readability between entries
 			if err != nil {
-				return fmt.Errorf("failed to write separator to file: %w", err)
+				return fmt.Errorf("failed to write separator to file after commit %s: %w", data.Hash, err)
 			}
 		}
 	}
@@ -358,6 +389,26 @@ func getPatchForCommit(repoPath, commitHash string) (string, error) {
 		return "", fmt.Errorf(errMsg)
 	}
 	return string(patchBytes), nil
+}
+
+// getCommitMetadata retrieves the hash, author, and date for a given commit.
+func getCommitMetadata(repoPath, commitHash string) (hash, author, date string, err error) {
+	cmd := exec.Command("git", "-C", repoPath, "show", "-s", fmt.Sprintf("--format=%s", "%H%n%an%n%ai"), commitHash)
+	output, err := cmd.Output()
+	if err != nil {
+		errMsg := fmt.Sprintf("failed to execute git show for metadata on commit %s: %v", commitHash, err)
+		if ee, ok := err.(*exec.ExitError); ok {
+			errMsg = fmt.Sprintf("%s. Stderr: %s", errMsg, string(ee.Stderr))
+		}
+		return "", "", "", fmt.Errorf(errMsg)
+	}
+
+	parts := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(parts) < 3 {
+		return "", "", "", fmt.Errorf("unexpected format from git show for metadata on commit %s: expected 3 lines, got %d. Output: %s", commitHash, len(parts), string(output))
+	}
+
+	return parts[0], parts[1], parts[2], nil
 }
 
 // getCommitHashes returns a list of commit hashes from HEAD to the specified endCommitID (inclusive)
@@ -498,3 +549,4 @@ func loadConfig() (*Config, error) {
 
 	return &config, nil
 }
+

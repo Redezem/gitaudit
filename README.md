@@ -73,7 +73,21 @@ This will:
 ## Output
 
 - **Console:** Progress messages, errors, and a summary of processed and failed commits.
-- **`gitaudit.txt`:** A text file created in the current working directory containing all successfully AI-generated commit messages, separated by `---`. Each message corresponds to a commit in the specified range, ordered from newest (`HEAD`) to oldest.
+- **`gitaudit.txt`:** A text file created in the current working directory. Each entry in this file corresponds to a commit in the specified range (ordered newest to oldest) and includes:
+    - Git commit hash
+    - Git commit author
+    - Git commit date
+    - The AI-generated detailed summary
+    
+    Entries are separated by `---`. An example entry looks like:
+    ```
+    Commit: <hash_value>
+    Author: <author_name>
+    Date: <commit_date>
+
+    <AI-generated summary text...>
+    ---
+    ```
 
 ## Development
 
@@ -81,3 +95,4 @@ To make changes to the tool:
 1. Modify the Go source files (`.go`).
 2. Rebuild the application using `go build .`.
 ```
+
