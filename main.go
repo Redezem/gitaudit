@@ -9,9 +9,15 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
+
+var interrupted bool = false
+var mu sync.Mutex // To protect access to `interrupted` if needed, though current usage is simple
 
 // OllamaRequest defines the structure for requests to the Ollama API.
 type OllamaRequest struct {
@@ -54,6 +60,17 @@ func main() {
 	fmt.Printf("Ollama Endpoint: %s\n", config.OllamaEndpoint)
 	fmt.Printf("Ollama Model: %s\n", config.OllamaModel)
 
+	// Setup signal handling for Ctrl+C
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Println("\nCtrl+C received. Shutting down gracefully...")
+		mu.Lock()
+		interrupted = true
+		mu.Unlock()
+	}()
+
 	commitHashes, err := getCommitHashes(*repoPath, *commitID)
 	if err != nil {
 		fmt.Printf("Error getting commit hashes: %v\n", err)
@@ -66,21 +83,36 @@ func main() {
 	}
 
 	var allGeneratedMessages []string // Slice to store all AI-generated messages
-	var failedCommits []string        // Slice to store hashes of commits that failed processing
+	var retryQueueCommits []string    // Slice to store commit hashes that need retrying
 
-	// Generate patches for each commit
+	// Initial processing loop
+	fmt.Println("--- Initial Processing Pass ---")
 	for _, commitHash := range commitHashes {
+		mu.Lock()
+		if interrupted {
+			mu.Unlock()
+			fmt.Println("Interrupted during initial processing pass.")
+			// Add remaining initial commits to retryQueue so they are reported as pending
+			// Find current commitHash in commitHashes and add the rest
+			for i, h := range commitHashes {
+				if h == commitHash {
+					retryQueueCommits = append(retryQueueCommits, commitHashes[i:]...)
+					break
+				}
+			}
+			break // Exit initial processing loop
+		}
+		mu.Unlock()
+
 		fmt.Printf("Processing commit: %s\n", commitHash)
 		patch, err := getPatchForCommit(*repoPath, commitHash)
 		if err != nil {
-			errMsg := fmt.Sprintf("Error generating patch for commit %s: %v", commitHash, err)
+			errMsg := fmt.Sprintf("Error generating patch for commit %s: %v. Adding to retry queue.", commitHash, err)
 			fmt.Println(errMsg)
-			failedCommits = append(failedCommits, fmt.Sprintf("%s (patch generation failed: %v)", commitHash, err))
+			retryQueueCommits = append(retryQueueCommits, commitHash)
 			continue
 		}
-		// fmt.Printf("\n--- Patch for %s ---\n", commitHash) // Optional: for debugging
 
-		// Construct the prompt for Ollama
 		prompt := fmt.Sprintf(`Given the following Git patch, please generate a highly detailed and descriptive Git commit message. The message should cover:
 1. A summary of the changes.
 2. The reasoning behind the changes (why they were made).
@@ -92,16 +124,99 @@ Do not include the "Patch:" prefix or any introductory phrases like "Here's a co
 Patch:
 %s`, patch)
 
-		// Send to Ollama
 		generatedMessage, err := callOllama(config.OllamaEndpoint, config.OllamaModel, prompt)
 		if err != nil {
-			errMsg := fmt.Sprintf("Error calling Ollama for commit %s: %v", commitHash, err)
+			errMsg := fmt.Sprintf("Error calling Ollama for commit %s: %v. Adding to retry queue.", commitHash, err)
 			fmt.Println(errMsg)
-			failedCommits = append(failedCommits, fmt.Sprintf("%s (Ollama call failed: %v)", commitHash, err))
+			retryQueueCommits = append(retryQueueCommits, commitHash)
 			continue
 		}
 		fmt.Printf("Successfully generated message for commit %s\n", commitHash)
 		allGeneratedMessages = append(allGeneratedMessages, generatedMessage)
+	}
+
+	// Retry loop
+	if len(retryQueueCommits) > 0 && !interrupted { // Check interrupted flag before starting retry loop
+		fmt.Println("\n--- Starting Retry Processing ---")
+	}
+	for len(retryQueueCommits) > 0 {
+		mu.Lock()
+		if interrupted {
+			mu.Unlock()
+			fmt.Println("Interrupted during retry processing.")
+			break // Exit retry loop
+		}
+		mu.Unlock()
+
+		fmt.Printf("Commits in retry queue: %d\n", len(retryQueueCommits))
+		currentFailures := 0 // To detect if all attempts in a retry pass fail
+
+		var nextRetryQueue []string
+		for _, commitHash := range retryQueueCommits {
+			mu.Lock()
+			if interrupted {
+				mu.Unlock()
+				// Add current and remaining retry commits to nextRetryQueue to be reported as pending
+				// Find current commitHash in retryQueueCommits and add it and the rest
+				for i, h := range retryQueueCommits {
+					if h == commitHash {
+						nextRetryQueue = append(nextRetryQueue, retryQueueCommits[i:]...)
+						break
+					}
+				}
+				break // Exit inner loop for this pass
+			}
+			mu.Unlock()
+
+			fmt.Printf("Retrying commit: %s\n", commitHash)
+			patch, err := getPatchForCommit(*repoPath, commitHash)
+			if err != nil {
+				errMsg := fmt.Sprintf("Error generating patch for commit %s during retry: %v. Will retry again.", commitHash, err)
+				fmt.Println(errMsg)
+				nextRetryQueue = append(nextRetryQueue, commitHash)
+				currentFailures++
+				continue
+			}
+
+			prompt := fmt.Sprintf(`Given the following Git patch, please generate a highly detailed and descriptive Git commit message. The message should cover:
+1. A summary of the changes.
+2. The reasoning behind the changes (why they were made).
+3. Any problems that were encountered (if apparent from the patch or commit message).
+4. The intended purpose or goal of the commit.
+
+Do not include the "Patch:" prefix or any introductory phrases like "Here's a commit message:". Output only the commit message itself.
+
+Patch:
+%s`, patch)
+
+			generatedMessage, err := callOllama(config.OllamaEndpoint, config.OllamaModel, prompt)
+			if err != nil {
+				errMsg := fmt.Sprintf("Error calling Ollama for commit %s during retry: %v. Will retry again.", commitHash, err)
+				fmt.Println(errMsg)
+				nextRetryQueue = append(nextRetryQueue, commitHash)
+				currentFailures++
+				continue
+			}
+			fmt.Printf("Successfully generated message for commit %s on retry\n", commitHash)
+			allGeneratedMessages = append(allGeneratedMessages, generatedMessage)
+		}
+		retryQueueCommits = nextRetryQueue
+
+		if len(retryQueueCommits) > 0 && currentFailures == len(retryQueueCommits) {
+			fmt.Printf("All %d commits in the current retry pass failed. Retrying them again in the next pass.\n", currentFailures)
+			// No sleep here as per "ad infinitum" but in a real-world scenario, a small delay might be added.
+		}
+		// If the inner loop was broken due to interruption, retryQueueCommits might be populated by the interruption logic.
+		// If not, it's populated by nextRetryQueue from a normal pass.
+		if !interrupted {
+			retryQueueCommits = nextRetryQueue
+		}
+
+
+		if len(retryQueueCommits) > 0 && currentFailures == len(retryQueueCommits) && !interrupted {
+			fmt.Printf("All %d commits in the current retry pass failed. Retrying them again in the next pass.\n", currentFailures)
+			// No sleep here as per "ad infinitum" but in a real-world scenario, a small delay might be added.
+		}
 	}
 
 	// Write all successful messages to gitaudit.txt
@@ -110,7 +225,6 @@ Patch:
 		err = writeMessagesToFile(outputFileName, allGeneratedMessages)
 		if err != nil {
 			fmt.Printf("Error writing messages to file %s: %v\n", outputFileName, err)
-			// Not exiting here, as we still want to report failed commits
 		} else {
 			fmt.Printf("\nSuccessfully wrote %d generated messages to %s\n", len(allGeneratedMessages), outputFileName)
 		}
@@ -118,11 +232,31 @@ Patch:
 		fmt.Println("\nNo messages were successfully generated to write to file.")
 	}
 
-	if len(failedCommits) > 0 {
-		fmt.Printf("\n--- Failed Commits (%d) ---\n", len(failedCommits))
-		for _, failed := range failedCommits {
-			fmt.Println(failed)
+	mu.Lock()
+	isInterrupted := interrupted
+	mu.Unlock()
+
+	if isInterrupted {
+		fmt.Println("\nProcess was interrupted.")
+		if len(retryQueueCommits) > 0 {
+			fmt.Printf("The following %d commits were pending processing or retry:\n", len(retryQueueCommits))
+			// Remove duplicates that might have occurred if interruption happened during list copying
+			uniquePendingCommits := make(map[string]bool)
+			var finalList []string
+			for _, commitHash := range retryQueueCommits {
+				if !uniquePendingCommits[commitHash] {
+					uniquePendingCommits[commitHash] = true
+					finalList = append(finalList, commitHash)
+				}
+			}
+			for _, commitHash := range finalList {
+				fmt.Println(commitHash)
+			}
+		} else {
+			fmt.Println("No commits were pending retry.")
 		}
+	} else {
+		fmt.Println("\nAll commits processed successfully.")
 	}
 }
 
